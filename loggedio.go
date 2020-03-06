@@ -1,19 +1,23 @@
 // loggedio proxies calls to io.Reader, io.Writer, io.Closer, and net.Conn
 // interfaces, reporting their read, write, error, and close events.
 //
-// The proxied object is not checked for compatibility. If you attempt to call
+// LoggedIO uses duck typing, meaning that the proxied object is not checked
+// for compatibility until you actually call a method. If you attempt to call
 // a proxied method that the object doesn't actually implement, it will panic.
-// It's recommended to cast to the expected interface before use.
+// It's recommended to cast to the expected interface before use for better type
+// safety.
 //
-// Loggedio supports reporting to writers and the go log out of the box. Other
-// reporting mechanisms can easily be added using `loggedio.Generic()`.
+// Loggedio supports reporting to files, writers and the go log out of the box.
+// Other reporting mechanisms can easily be added using `loggedio.Generic()`.
 package loggedio
 
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"time"
 )
@@ -37,52 +41,109 @@ func Generic(proxiedObject interface{},
 // as strings to the go log. readFmt and writeFmt must contain a single %v for
 // the payload contents. errFmt must contain a %v for the location where the
 // error occured, and a second %v for the error payload (in that order).
+//
+// If any string param is empty, that particular reporting functionality will
+// be disabled.
 func StringToLog(proxiedObject interface{},
 	readFmt, writeFmt, errorFmt, closeMsg string) *LoggedIOProxy {
+
 	return Generic(proxiedObject,
-		func(b []byte) { log.Printf(readFmt, string(b)) },
-		func(b []byte) { log.Printf(writeFmt, string(b)) },
-		func(location string, err error) { log.Printf(errorFmt, location, err) },
-		func() { log.Printf("%v", closeMsg) })
+		byteFunc(readFmt, func(b []byte) { log.Printf(readFmt, string(b)) }),
+		byteFunc(writeFmt, func(b []byte) { log.Printf(writeFmt, string(b)) }),
+		errFunc(errorFmt, func(location string, err error) { log.Printf(errorFmt, location, err) }),
+		closeFunc(closeMsg, func() { log.Printf("%v", closeMsg) }))
 }
 
 // HexToLog creates a logged I/O proxy that writes the hex encoded contents of
 // the data to the go log. readFmt and writeFmt must contain a single %v for the
 // payload contents. errFmt must contain a %v for the location where the error
 // occured, and a second %v for the error payload, in that order.
+//
+// If any string param is empty, that particular reporting functionality will
+// be disabled.
 func HexToLog(proxiedObject interface{},
 	readFmt, writeFmt, errorFmt, closeMsg string) *LoggedIOProxy {
 	return Generic(proxiedObject,
-		func(b []byte) { log.Printf(readFmt, toHex(b)) },
-		func(b []byte) { log.Printf(writeFmt, toHex(b)) },
-		func(location string, err error) { log.Printf(errorFmt, location, err) },
-		func() { log.Printf("%v", closeMsg) })
+		byteFunc(readFmt, func(b []byte) { log.Printf(readFmt, toHex(b)) }),
+		byteFunc(readFmt, func(b []byte) { log.Printf(writeFmt, toHex(b)) }),
+		errFunc(errorFmt, func(location string, err error) { log.Printf(errorFmt, location, err) }),
+		closeFunc(closeMsg, func() { log.Printf("%v", closeMsg) }))
 }
 
 // StringToWriter creates a logged I/O proxy that writes the contents of the
 // data as strings to the specified writer. readFmt and writeFmt must contain a
 // single %v for the payload contents. errFmt must contain a %v for the location
 // where the error occured, and a second %v for the error payload, in that order.
+//
+// If any string param is empty, that particular reporting functionality will
+// be disabled.
 func StringToWriter(proxiedObject interface{}, writer io.Writer,
 	readFmt, writeFmt, errorFmt, closeMsg string) *LoggedIOProxy {
 	return Generic(proxiedObject,
-		func(b []byte) { fmt.Fprintf(writer, readFmt, string(b)) },
-		func(b []byte) { fmt.Fprintf(writer, writeFmt, string(b)) },
-		func(location string, err error) { fmt.Fprintf(writer, errorFmt, location, err) },
-		func() { fmt.Fprintf(writer, "%v", closeMsg) })
+		byteFunc(readFmt, func(b []byte) { fmt.Fprintf(writer, readFmt, string(b)) }),
+		byteFunc(readFmt, func(b []byte) { fmt.Fprintf(writer, writeFmt, string(b)) }),
+		errFunc(errorFmt, func(location string, err error) { fmt.Fprintf(writer, errorFmt, location, err) }),
+		closeFunc(closeMsg, func() { writer.Write([]byte(closeMsg)) }))
 }
 
 // HexToWriter creates a logged I/O proxy that writes the hex encoded contents
 // of the data to the specified writer. readFmt and writeFmt must contain a
 // single %v for the payload contents. errFmt must contain a %v for the location
 // where the error occured, and a second %v for the error payload, in that order.
+//
+// If any string param is empty, that particular reporting functionality will
+// be disabled.
 func HexToWriter(proxiedObject interface{}, writer io.Writer,
 	readFmt, writeFmt, errorFmt, closeMsg string) *LoggedIOProxy {
 	return Generic(proxiedObject,
-		func(b []byte) { fmt.Fprintf(writer, readFmt, toHex(b)) },
-		func(b []byte) { fmt.Fprintf(writer, writeFmt, toHex(b)) },
-		func(location string, err error) { fmt.Fprintf(writer, errorFmt, location, err) },
-		func() { fmt.Fprintf(writer, "%v", closeMsg) })
+		byteFunc(readFmt, func(b []byte) { fmt.Fprintf(writer, readFmt, toHex(b)) }),
+		byteFunc(readFmt, func(b []byte) { fmt.Fprintf(writer, writeFmt, toHex(b)) }),
+		errFunc(errorFmt, func(location string, err error) { fmt.Fprintf(writer, errorFmt, location, err) }),
+		closeFunc(closeMsg, func() { writer.Write([]byte(closeMsg)) }))
+}
+
+// DumpToWriter creates a logged I/O proxy that dumps the contents of the data
+// to writers (one for all reads, one for all writes). Errors and closes are
+// logged to a separate notify writer. errFmt must contain a %v for the location
+// where the error occured, and a second %v for the error payload, in that order.
+//
+// If any string param is empty, that particular reporting functionality will
+// be disabled.
+func DumpToWriters(proxiedObject interface{}, readWriter, writeWriter, notifyWriter io.Writer,
+	errorFmt, closeMsg string) *LoggedIOProxy {
+	errorFunc := errFunc(errorFmt, func(location string, err error) {
+		fmt.Fprintf(notifyWriter, errorFmt, location, err)
+	})
+	return Generic(proxiedObject,
+		func(b []byte) {
+			if _, err := readWriter.Write(b); err != nil {
+				errorFunc("LoggedIO readWriter", err)
+			}
+		},
+		func(b []byte) {
+			if _, err := writeWriter.Write(b); err != nil {
+				errorFunc("LoggedIO writeWriter", err)
+			}
+		},
+		errFunc(errorFmt, func(location string, err error) { fmt.Fprintf(notifyWriter, errorFmt, location, err) }),
+		closeFunc(closeMsg, func() { notifyWriter.Write([]byte(closeMsg)) }))
+}
+
+// DumpToFiles creates a logged I/O proxy that dumps the contents of the data
+// to files (one for all reads, one for all writes, one for other events).
+// The specified files will be truncated and filled with their respective contents.
+// The special file names "stdout" and "stderr" will write to those streams
+// instead of creating files. The special filename "null" will write to nowhere.
+// errFmt must contain a %v for the location where the error occured, and a
+// second %v for the error payload, in that order.
+//
+// If any string param is empty, that particular reporting functionality will
+// be disabled.
+func DumpToFiles(proxiedObject interface{}, readFilename, writeFilename, notifyFilename string,
+	errorFmt, closeMsg string) *LoggedIOProxy {
+	return DumpToWriters(proxiedObject, writerForFile(readFilename),
+		writerForFile(writeFilename), writerForFile(notifyFilename),
+		errorFmt, closeMsg)
 }
 
 // LoggedIOProxy implements io.Reader, io.Writer, io.Closer, and net.Conn,
@@ -185,4 +246,43 @@ func toHex(b []byte) string {
 		}
 	}
 	return builder.String()
+}
+
+func writerForFile(filename string) io.Writer {
+	switch filename {
+	case "stdout":
+		return os.Stdout
+	case "stderr":
+		return os.Stderr
+	case "null":
+		return ioutil.Discard
+	default:
+		writer, err := os.Create(filename)
+		if err != nil {
+			log.Printf("LoggedIO: Error creating %v: %v", filename, err)
+			return ioutil.Discard
+		}
+		return writer
+	}
+}
+
+func byteFunc(format string, function func([]byte)) func([]byte) {
+	if format == "" {
+		return func([]byte) {}
+	}
+	return function
+}
+
+func errFunc(format string, function func(string, error)) func(string, error) {
+	if format == "" {
+		return func(string, error) {}
+	}
+	return function
+}
+
+func closeFunc(msg string, function func()) func() {
+	if msg == "" {
+		return func() {}
+	}
+	return function
 }

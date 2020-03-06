@@ -430,25 +430,33 @@ func TestWrongInterface(t *testing.T) {
 }
 
 func Demonstrate() {
-	buffer := make([]byte, 8, 8)
-	writer := &bytes.Buffer{}
-	proxy := StringToWriter(writer, os.Stdout, "R [%v]\n", "W [%v]\n", "E [%v: %v]\n", "C\n")
+	readerWriter := &bytes.Buffer{}
+	var err error
 
-	n, err := proxy.Write([]byte("Testing!"))
-	if err != nil {
+	// Log all reads/writes as hex to stdout:
+	proxy := HexToWriter(readerWriter, os.Stdout, "R [%v]\n", "W [%v]\n", "E [%v: %v]\n", "C\n")
+	if _, err = proxy.Write([]byte{1, 2, 0xae, 0xf1}); err != nil {
 		// TODO
 	}
-	_ = n
 
-	n, err = proxy.Read(buffer)
-	if err != nil {
+	readerWriter.Reset()
+
+	// Log all reads/writes as both hex AND strings (chaining together two proxies):
+	stringProxy := StringToWriter(readerWriter, os.Stdout, "RS [%v]\n", "WS [%v]\n", "E [%v: %v]\n", "C\n")
+	hexProxy := HexToWriter(stringProxy, os.Stdout, "RH [%v]\n", "WH [%v]\n", "", "")
+
+	if _, err = hexProxy.Write([]byte("Testing")); err != nil {
 		// TODO
 	}
-	_ = n
 
-	writer.Reset()
-	proxy = HexToWriter(writer, os.Stdout, "R [%v]\n", "W [%v]\n", "E [%v: %v]\n", "C\n")
-	proxy.Write([]byte{1, 2, 0xae, 0xf1})
+	if _, err = hexProxy.Write([]byte(" 1 2 3!")); err != nil {
+		// TODO
+	}
+
+	buffer := make([]byte, readerWriter.Len())
+	if _, err = hexProxy.Read(buffer); err != nil {
+		// TODO
+	}
 }
 
 func TestDemonstrate(t *testing.T) {
